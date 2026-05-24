@@ -1,0 +1,17 @@
+streamlit
+pandas
+requests
+plotly
+newspaper3k
+openai
+langchain
+langchain-openai
+langchain-community
+langchain-core
+langchain-text-splitters
+faiss-cpu
+lxml
+lxml_html_clean
+beautifulsoup4
+tiktoken
+scikit-learn
