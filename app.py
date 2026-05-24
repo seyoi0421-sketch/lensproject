@@ -18,6 +18,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from difflib import SequenceMatcher
 
 
 # =====================================================
@@ -115,6 +116,29 @@ def is_valid_article(text):
     sentences = re.split(r"[.!?。]|다\.|요\.", text)
     return len(sentences) >= 3
 
+def is_relevant_to_query(query, title, description, text):
+    query = query.strip()
+    combined_title = f"{title} {description}"
+    combined_text = f"{title} {description} {text[:2000]}"
+
+    # 제목 또는 설명에 검색어가 없으면 제외
+    if query not in combined_title:
+        return False
+
+    # 본문에서도 검색어가 최소 2번 이상 등장해야 통과
+    if combined_text.count(query) < 2:
+        return False
+
+    # 너무 정치/선거 공약 중심 기사 제외
+    exclude_words = [
+        "후보", "공약", "민주당", "국민의힘", "대선", "선거",
+        "이재명", "김문수", "권력", "외교", "전략 전방위"
+    ]
+
+    if any(word in combined_text for word in exclude_words):
+        return False
+
+    return True
 
 def make_list(value):
     if isinstance(value, list):
@@ -327,24 +351,41 @@ def calculate_overall_balance_score(final_df):
 
 
 def calculate_article_balance_score(row):
+    text = str(row.get("cleaned_text", ""))
+
     emotional_count = len(make_list(row.get("emotional_expressions")))
     assertive_count = len(make_list(row.get("assertive_expressions")))
     missing_count = len(make_list(row.get("missing_perspectives")))
 
     tone = str(row.get("tone_label", "중립"))
+    text_len = max(len(text), 1)
 
-    score = 70
+    strong_words = [
+        "논란", "비판", "우려", "강력", "충격", "심각", "반발",
+        "피해", "갈등", "위기", "논쟁", "분노", "불안", "문제"
+    ]
 
-    # 감정·단정 표현 많으면 감소
-    score -= min(emotional_count * 4, 16)
-    score -= min(assertive_count * 5, 20)
+    strong_word_count = sum(text.count(word) for word in strong_words)
+    strong_word_density = strong_word_count / text_len * 1000
 
-    # 빠진 관점 많으면 균형성 감소
-    score -= min(missing_count * 6, 18)
+    score = 82
 
-    # 톤 보정
+    score -= min(emotional_count * 2, 8)
+    score -= min(assertive_count * 2.5, 10)
+    score -= min(missing_count * 2.5, 8)
+
+    # 이슈 특성상 자주 나오는 강한 단어는 약하게만 반영
+    score -= min(strong_word_density * 1.5, 6)
+
     if tone == "중립":
-        score += 10
+        score += 5
+    elif tone == "우려":
+        score -= 1
+    elif tone in ["비판", "강조"]:
+        score -= 3
+
+    # 기사별 차이를 위한 약한 보정
+    score += min(3, max(-3, (text_len - 1500) / 700))
 
     return int(max(0, min(100, round(score))))
 
@@ -450,56 +491,88 @@ def search_naver_news(query, display=30, sort="sim"):
 
     return response.json().get("items", [])
 
-
 def collect_articles(query, max_articles=5):
-    items = search_naver_news(query, display=40, sort="sim")
+    search_queries = [
+        f"{query} 피해자 인터뷰",
+        f"{query} 보증금 반환",
+        f"{query} 임대인 처벌",
+        f"{query} 정부 대책",
+        f"{query} 특별법",
+        f"{query} 법원 판결",
+        f"{query} 경찰 수사",
+    ]
 
     articles = []
     seen_urls = set()
+    seen_title_list = []
+    seen_text_list = []
+    press_count = {}
 
-    for item in items:
+    # 관점별 검색어에서 1개씩만 뽑기
+    for q in search_queries:
         if len(articles) >= max_articles:
             break
 
-        title = remove_html(item.get("title", ""))
-        description = remove_html(item.get("description", ""))
-        article_url = item.get("originallink") or item.get("link")
+        items = search_naver_news(q, display=20, sort="sim") + search_naver_news(q, display=10, sort="date")
 
-        if not article_url or article_url in seen_urls:
-            continue
+        for item in items:
+            title = remove_html(item.get("title", ""))
+            description = remove_html(item.get("description", ""))
+            article_url = item.get("originallink") or item.get("link")
+            press = get_press_name(article_url)
 
-        seen_urls.add(article_url)
-
-        try:
-            article = Article(article_url, language="ko")
-            article.download()
-            article.parse()
-
-            raw_text = article.text
-            if not raw_text:
+            if not article_url or article_url in seen_urls:
                 continue
 
-            cleaned_text = clean_news_text(raw_text)
-
-            if not is_valid_article(cleaned_text):
+            if press_count.get(press, 0) >= 1:
                 continue
 
-            articles.append({
-                "query": query,
-                "title": article.title if article.title else title,
-                "description": description,
-                "url": article_url,
-                "press": get_press_name(article_url),
-                "pub_date": item.get("pubDate", ""),
-                "cleaned_text": cleaned_text,
-                "collected_at": datetime.now().strftime("%Y.%m.%d %H:%M")
-            })
+            try:
+                article = Article(article_url, language="ko")
+                article.download()
+                article.parse()
 
-        except Exception:
-            continue
+                raw_text = article.text
+                if not raw_text:
+                    continue
+
+                cleaned_text = clean_news_text(raw_text)
+
+                if not is_valid_article(cleaned_text):
+                    continue
+
+                if not is_relevant_to_query(query, title, description, cleaned_text):
+                    continue
+
+                if any(SequenceMatcher(None, title, old).ratio() >= 0.45 for old in seen_title_list):
+                    continue
+
+                current_sample = cleaned_text[:800]
+                if any(SequenceMatcher(None, current_sample, old).ratio() >= 0.35 for old in seen_text_list):
+                    continue
+
+                seen_urls.add(article_url)
+                seen_title_list.append(title)
+                seen_text_list.append(current_sample)
+                press_count[press] = press_count.get(press, 0) + 1
+
+                articles.append({
+                    "query": query,
+                    "title": article.title if article.title else title,
+                    "description": description,
+                    "url": article_url,
+                    "press": press,
+                    "pub_date": item.get("pubDate", ""),
+                    "cleaned_text": cleaned_text,
+                    "collected_at": datetime.now().strftime("%Y.%m.%d %H:%M")
+                })
+
+                break  # 이 검색어에서는 1개만 뽑고 다음 관점 검색어로 이동
+
+            except Exception:
+                continue
 
     return articles
-
 
 # =====================================================
 # 실시간 뉴스 RAG 구성
@@ -587,7 +660,15 @@ URL: {url}
 
 
 def analyze_issue_with_rag(query, vectorstore, k=8):
-    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": k,
+            "fetch_k": 20,
+            "lambda_mult": 0.7
+        }
+    )
+
     retrieved_docs = retriever.invoke(query)
     context = format_docs_for_prompt(retrieved_docs)
 
@@ -701,15 +782,15 @@ def analyze_one_article(article):
 반드시 아래 JSON 형식으로만 답해.
 
 {{
-  "summary": "기사의 핵심 사건 요약",
+  "summary": "기사를 읽지 않아도 이해할 수 있도록 핵심 배경, 사건 내용, 주요 이해관계자, 쟁점을 포함해 3~4문장으로 요약",
   "main_claim": "기사에서 가장 강조하는 주장",
   "framing": "기사가 사건을 어떤 관점 중심으로 바라보는지 짧은 프레이밍 라벨만 생성. 예: 경제 성장 중심 / 갈등 중심 / 정책 효과 중심 / 피해자 관점 중심 / 산업 혁신 중심",
   "tone_label": "중립/우려/비판/긍정/강조 중 하나",
   "key_keywords": ["핵심 키워드 1", "핵심 키워드 2", "핵심 키워드 3"],
   "issue_position_score": "0~100 사이 정수. 기사 관점의 위치를 나타내는 참고 점수. 한쪽 주장만 강하게 강조하면 낮거나 높게, 여러 관점을 함께 제시하면 중간에 가깝게 평가",
-  "emotional_expressions": ["감정적 표현 예시 1", "감정적 표현 예시 2"],
-  "assertive_expressions": ["단정적 표현 예시 1", "단정적 표현 예시 2"],
-  "missing_perspectives": ["빠져 있을 수 있는 관점 1", "빠져 있을 수 있는 관점 2"],
+  "emotional_expressions": "기사에 실제로 등장한 감정적 표현만 배열로 작성. 없으면 빈 배열 []",
+  "assertive_expressions": "기사에 실제로 등장한 단정적 표현만 배열로 작성. 없으면 빈 배열 []",
+  "missing_perspectives": "기사에서 충분히 다루지 않은 관점만 배열로 작성. 없으면 빈 배열 []",2"],
   "balance_score": "0~100 사이 정수. 기사 안에서 반론, 이해관계자, 누락 가능성, 표현 균형이 얼마나 드러나는지 평가",
   "one_line_comment": "사용자에게 보여줄 한 줄 설명"
 }}
@@ -815,79 +896,97 @@ def generate_related_keywords(query, max_keywords=8):
 
 
 # =====================================================
-# UI/UX 강화 CSS
+# UI/UX 강화 CSS - Light Professional Theme
 # =====================================================
 st.markdown(
     """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;700;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600;700;800;900&display=swap');
 
 html, body, [class*="css"] {
     font-family: 'Pretendard', sans-serif;
 }
 
 .stApp {
-    background: radial-gradient(circle at 50% 0%, #1e293b 0%, #0f172a 55%, #020617 100%);
-    color: #f8fafc;
+    background: #f8fafc;
+    color: #0f172a;
 }
 
 .block-container {
     padding-top: 2rem;
     padding-bottom: 4rem;
+    max-width: 1180px;
 }
 
+/* 상단 */
 .hero-container {
-    padding: 2.5rem 1rem 1.8rem 1rem;
-    text-align: center;
+    padding: 2rem 0 1.2rem 0;
+    text-align: left;
+    border-bottom: 1px solid #e2e8f0;
+    margin-bottom: 1.5rem;
 }
 
 .hero-title {
-    font-size: 64px;
+    font-size: 48px;
     font-weight: 900;
-    background: linear-gradient(90deg, #60a5fa, #38bdf8, #0ea5e9);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    letter-spacing: -3px;
-    margin-bottom: 10px;
+    color: #0f172a;
+    letter-spacing: -2px;
+    margin-bottom: 8px;
+}
+
+.hero-title span {
+    color: #2563eb;
 }
 
 .hero-copy {
-    font-size: 18px;
-    color: #cbd5e1;
+    font-size: 17px;
+    color: #475569;
     font-weight: 500;
     line-height: 1.7;
 }
 
+/* 안내 박스 */
 .notice-box {
-    background: rgba(15, 23, 42, 0.72);
-    border: 1px solid rgba(148, 163, 184, 0.22);
-    border-radius: 20px;
-    padding: 18px 22px;
-    margin-bottom: 22px;
-    color: #d1d5db;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.20);
-    backdrop-filter: blur(12px);
+    background: #ffffff;
+    border-left: 5px solid #2563eb;
+    border-top: 1px solid #dbeafe;
+    border-right: 1px solid #dbeafe;
+    border-bottom: 1px solid #dbeafe;
+    border-radius: 16px;
+    padding: 20px 24px;
+    margin-bottom: 24px;
+    color: #334155;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
 }
 
+/* 카드 */
 .card, .summary-card, .mini-card {
-    background: rgba(30, 41, 59, 0.62);
-    border: 1px solid rgba(255, 255, 255, 0.10);
-    border-radius: 22px;
-    padding: 22px;
-    margin-bottom: 18px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.20);
-    backdrop-filter: blur(14px);
+    background: #ffffff;
+    border:1px solid #dbeafe;
+    border-left:6px solid #2563eb;
+    border-radius:18px;
+    padding:22px;
+    margin-bottom:18px;
+    box-shadow:
+    0 8px 22px rgba(15,23,42,.05);
+}
+
+.card{
+    height:310px;
+    display:flex;
+    flex-direction:column;
+    justify-content:flex-start;
 }
 
 .card-title {
-    font-size: 19px;
-    font-weight: 850;
+    font-size: 18px;
+    font-weight: 800;
     margin-bottom: 12px;
-    color: #f8fafc;
+    color: #0f172a;
 }
 
 .meta-text {
-    color: #cbd5e1;
+    color: #475569;
     font-size: 14px;
     line-height: 1.8;
 }
@@ -896,20 +995,21 @@ html, body, [class*="css"] {
     font-size: 22px;
     font-weight: 850;
     margin-bottom: 12px;
-    color: #93c5fd;
+    color: #1d4ed8;
 }
 
 .summary-card-body {
     font-size: 16px;
     line-height: 1.85;
-    color: #e5e7eb;
+    color: #1e293b;
 }
 
+/* 점수 배지 */
 .score-badge {
     display: inline-block;
-    background: rgba(37, 99, 235, 0.25);
-    color: #dbeafe;
-    border: 1px solid rgba(96, 165, 250, 0.35);
+    background: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
     padding: 7px 13px;
     border-radius: 999px;
     font-size: 14px;
@@ -918,155 +1018,247 @@ html, body, [class*="css"] {
 }
 
 .article-link {
-    color: #93c5fd !important;
+    color: #2563eb !important;
     text-decoration: none !important;
     font-weight: 800;
 }
 
+/* 버튼 */
 .stButton > button {
-    background: linear-gradient(90deg, #2563eb, #0284c7) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 14px !important;
-    padding: 0.7rem 1.5rem !important;
-    font-weight: 800 !important;
-    transition: all 0.25s ease !important;
-    box-shadow: 0 8px 24px rgba(37, 99, 235, 0.32);
+    background:#ffffff !important;
+    color:#1e3a8a !important;
+    border:2px solid #2563eb !important;
+    border-radius:14px !important;
+    font-weight:700 !important;
+    box-shadow:
+    0 4px 12px rgba(37,99,235,.08);
+    transition:.25s;
 }
 
 .stButton > button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 12px 30px rgba(14, 165, 233, 0.38);
+    background:#f1f5f9 !important;
+    border-color:#94a3b8 !important;
+    color:#1e293b !important;
+    transform:none;
+    box-shadow:none;
 }
 
+.stButton > button:active {
+    background:#e2e8f0 !important;
+    border-color:#94a3b8 !important;
+    color:#1e293b !important;
+    box-shadow:none !important;
+}
+
+.related-button{
+    background:#ffffff;
+    border:2px solid #2563eb;
+    color:#1e293b;
+}
+
+/* 입력창/슬라이더 */
+.stTextInput label,
+.stSlider label,
+.stSelectbox label,
+.stRadio label {
+    color: #0f172a !important;
+    font-weight: 700 !important;
+}
+
+.stSlider span {
+    color: #334155 !important;
+}
+
+/* Metric */
 [data-testid="stMetric"] {
-    background: rgba(30, 41, 59, 0.55);
-    border: 1px solid rgba(255,255,255,0.09);
+    background: #ffffff;
+    border: 1px solid #dbeafe;
+    border-left: 5px solid #3b82f6;
     border-radius: 18px;
-    padding: 16px;
+    padding: 18px;
+    box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+}
+
+[data-testid="stMetricLabel"] {
+    color: #334155 !important;
+    font-weight: 700 !important;
 }
 
 [data-testid="stMetricValue"] {
+    color: #0f172a !important;
     font-weight: 900 !important;
-    color: #60a5fa !important;
 }
 
+/* 탭 */
 .stTabs [data-baseweb="tab-list"] {
     gap: 8px;
+    border-bottom: 1px solid #e2e8f0;
 }
 
 .stTabs [data-baseweb="tab"] {
     height: 46px;
-    background-color: rgba(255, 255, 255, 0.06);
+    background-color: #f1f5f9;
     border-radius: 12px 12px 0 0;
-    color: #cbd5e1;
+    color: #334155;
     padding: 0 18px;
-    font-weight: 700;
+    font-weight: 800;
 }
 
 .stTabs [aria-selected="true"] {
-    background-color: rgba(37, 99, 235, 0.22) !important;
-    color: #ffffff !important;
-    border-bottom: 2px solid #60a5fa !important;
+    background-color: #dbeafe !important;
+    color: #1d4ed8 !important;
+    border-bottom: 3px solid #2563eb !important;
 }
 
-.stProgress > div > div > div > div {
-    background-image: linear-gradient(to right, #60a5fa, #38bdf8) !important;
-}
-
+/* 관련 검색어 박스 */
 .related-box {
-    background: rgba(15, 23, 42, 0.58);
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    border-radius: 18px;
+    background: #ffffff;
+    border: 1px solid #dbeafe;
+    border-left: 5px solid #38bdf8;
+    border-radius: 16px;
     padding: 16px 18px;
     margin: 8px 0 20px 0;
 }
 
 .related-title {
-    color: #bfdbfe;
+    color: #0f172a;
     font-weight: 850;
     margin-bottom: 6px;
 }
 
 .related-desc {
-    color: #cbd5e1;
+    color: #64748b;
     font-size: 0.92rem;
 }
 
-/* text_input, slider 라벨 흰색 */
-.stTextInput label,
-.stSlider label {
-    color: #ffffff !important;
-    font-weight: 700 !important;
-}
-
-/* slider 숫자도 같이 밝게 */
-.stSlider span {
-    color: white !important;
-}
-
-/* metric 제목 흰색 */
-[data-testid="stMetricLabel"] {
-    color: #ffffff !important;
-    font-weight: 700 !important;
-}
-
-/* metric 값 (하늘색 유지) */
-[data-testid="stMetricValue"] {
-    color: #60a5fa !important;
-    font-weight: 900 !important;
-}
-
-/* ==============================
-   전체 텍스트 가독성 보정
-============================== */
-
-/* 기본 텍스트 */
+/* 텍스트 가독성 */
 .stMarkdown, .stMarkdown p, .stMarkdown span,
 .stWrite, p, span, div {
-    color: #e5e7eb;
+    color: #1e293b;
 }
 
-/* 제목류 */
 h1, h2, h3, h4, h5, h6 {
-    color: #ffffff !important;
+    color: #0f172a !important;
 }
 
-/* caption 설명문 */
 [data-testid="stCaptionContainer"] {
-    color: #cbd5e1 !important;
+    color: #64748b !important;
 }
 
-/* expander 내부 텍스트 */
+[data-testid="stExpander"] {
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 14px !important;
+}
+
 [data-testid="stExpander"] * {
-    color: #e5e7eb !important;
+    color: #1e293b !important;
 }
 
-/* st.text()로 출력되는 기사 원문 */
 [data-testid="stText"] {
-    color: #e5e7eb !important;
-    background: rgba(15, 23, 42, 0.75) !important;
-    border: 1px solid rgba(148, 163, 184, 0.18);
+    color: #1e293b !important;
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0;
     border-radius: 14px;
     padding: 16px;
     line-height: 1.8;
 }
 
-/* Plotly 축/설명 근처 Streamlit 텍스트 보정 */
+[data-testid="stDataFrame"]{
+    border:1px solid #dbeafe;
+    border-radius:16px;
+}
+
+/* Plotly */
 .js-plotly-plot text {
-    fill: #cbd5e1 !important;
+    fill: #334155 !important;
 }
 
-/* selectbox, radio 라벨 */
-.stSelectbox label,
-.stRadio label {
-    color: #ffffff !important;
-    font-weight: 700 !important;
-}
-
-/* info/success/warning 박스 내부 글씨 */
+/* 알림 박스 */
 [data-testid="stAlert"] * {
-    color: #f8fafc !important;
+    color: #0f172a !important;
+}
+
+/* 다운로드 버튼 */
+.stDownloadButton > button {
+    background: #ffffff !important;
+    color: #2563eb !important;
+    border: 1px solid #93c5fd !important;
+    border-radius: 12px !important;
+    font-weight: 800 !important;
+}
+.report-card, .report-section {
+    background:#ffffff;
+    border:1px solid #dbeafe;
+    border-left:6px solid #2563eb;
+    border-radius:18px;
+    padding:22px;
+    margin-bottom:20px;
+    box-shadow:0 8px 22px rgba(15,23,42,.05);
+}
+
+.report-card {
+    min-height:260px;
+}
+
+.report-title {
+    font-size:20px;
+    font-weight:850;
+    color:#0f172a;
+    margin-bottom:16px;
+}
+
+.report-item {
+    background:#f8fafc;
+    border:1px solid #e2e8f0;
+    border-radius:12px;
+    padding:14px 16px;
+    margin-bottom:12px;
+    line-height:1.7;
+    color:#1e293b;
+}
+
+.report-item.orange {
+    background:#fff7ed;
+    border-color:#fed7aa;
+}
+
+.report-empty {
+    color:#94a3b8;
+    font-size:14px;
+}
+
+.keyword-row {
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+}
+
+.keyword-pill {
+    display:inline-flex;
+    background:#eff6ff;
+    border:1px solid #bfdbfe;
+    color:#2563eb;
+    border-radius:999px;
+    padding:7px 13px;
+    font-size:13px;
+    font-weight:750;
+    white-space:nowrap;
+}
+
+.frame-item {
+    background:#f8fafc;
+    border-left:4px solid #2563eb;
+    border-radius:10px;
+    padding:13px 15px;
+    margin-bottom:10px;
+    line-height:1.7;
+}
+
+.missing-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:12px;
 }
 
 </style>
@@ -1093,12 +1285,17 @@ st.markdown(
 
 st.markdown(
     """
-    <div class="notice-box">
-        <b>📌 분석 안내</b><br><br>
-        • 검색어를 입력하면 네이버 뉴스 API에서 관련 주요 뉴스를 실시간으로 수집합니다.<br>
-        • 수집된 기사 본문은 전처리 후 chunk 단위로 분할되고 OpenAI Embedding으로 벡터화됩니다.<br>
-        • FAISS 벡터DB에서 관련 높은 기사 내용을 검색한 뒤, LLM이 근거 기반 관점 분석을 생성합니다.<br>
-        • 분석 결과는 참고용이며, 기사 내용의 사실 여부나 정치적 성향을 확정하지 않습니다.
+    <div style="
+        margin-top:-8px;
+        margin-bottom:18px;
+        padding-left:6px;
+        font-size:14px;
+        font-weight:500;
+        line-height:1.8;
+        color:#64748b;
+    ">
+        검색어를 구체화하면 관련 기사 정확도가 높아집니다.<br>
+        예: 촉법소년 → 촉법소년 연령 하향 · 소년법 개정 · 청소년 범죄 예방
     </div>
     """,
     unsafe_allow_html=True
@@ -1132,18 +1329,7 @@ with search_col2:
 keyword_col1, keyword_col2 = st.columns([1, 3])
 
 with keyword_col1:
-    recommend_button = st.button("✨ 관련 검색어 추천", use_container_width=True)
-
-with keyword_col2:
-    st.markdown(
-        """
-        <div class="related-box">
-            <div class="related-title">검색어를 더 구체화하면 수집 기사 품질이 좋아집니다.</div>
-            <div class="related-desc">예: 촉법소년 → 촉법소년 연령 하향, 소년법 개정, 청소년 범죄 예방</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    recommend_button = st.button("관련 검색어 추천", use_container_width=True)
 
 if recommend_button:
     if not query.strip():
@@ -1153,7 +1339,7 @@ if recommend_button:
             st.session_state.related_keywords = generate_related_keywords(query.strip())
 
 if st.session_state.related_keywords:
-    st.markdown("### 🔎 관련 검색어 추천")
+    st.markdown("### 관련 검색어 추천")
     st.caption("버튼을 누르면 검색창에 자동으로 반영됩니다. 이후 분석 시작 버튼을 눌러주세요.")
 
     keyword_cols = st.columns(4)
@@ -1177,17 +1363,17 @@ display:inline-block;
 ">
 
 <span style="
-color:#bfdbfe;
+color:#1e3a8a;
 font-size:14px;
-font-weight:600;
+font-weight:700;
 ">
 선택된 검색어:
 </span>
 
 <span style="
-color:white;
-font-size:14px;
-font-weight:800;
+color:#2563eb;
+font-size:16px;
+font-weight:900;
 ">
 {st.session_state.selected_related_keyword}
 </span>
@@ -1197,7 +1383,7 @@ font-weight:800;
     unsafe_allow_html=True
 )
 
-start_button = st.button("🔍 실시간 뉴스 RAG 분석 시작", use_container_width=True)
+start_button = st.button("실시간 뉴스 RAG 분석 시작", use_container_width=True)
 
 
 # =====================================================
@@ -1206,7 +1392,7 @@ start_button = st.button("🔍 실시간 뉴스 RAG 분석 시작", use_containe
 if start_button:
     query = query.strip()
     if not query:
-        st.warning("🔍 분석할 키워드를 입력해 주세요.")
+        st.warning("분석할 키워드를 입력해 주세요.")
     else:
         st.session_state.selected_related_keyword = query
         st.session_state.rag_result = None
@@ -1216,9 +1402,10 @@ if start_button:
         st.session_state.article_reactions = {}
         st.session_state.user_perspective_report = None
 
-        with st.status("🚀 LENS AI가 실시간 뉴스를 분석하고 있습니다...", expanded=True) as status:
-            st.write("📡 네이버 API에서 관련 기사를 수집 중...")
+        with st.status("LENS AI가 실시간 뉴스를 분석하고 있습니다...", expanded=True) as status:
+            st.write("네이버 API에서 관련 기사를 수집 중...")
             articles = collect_articles(query, max_articles=max_articles)
+            
 
             if len(articles) == 0:
                 status.update(label="❌ 수집된 기사가 없습니다.", state="error", expanded=True)
@@ -1227,7 +1414,7 @@ if start_button:
                 st.session_state.articles = articles
                 st.write(f"✅ {len(articles)}개 기사 수집 완료")
 
-                st.write("🧠 수집 기사 본문을 벡터DB로 변환 중...")
+                st.write("수집 기사 본문을 벡터DB로 변환 중...")
                 vectorstore = create_realtime_vectorstore(articles)
 
                 st.write("⚖️ RAG 기반 전체 관점 분석 중...")
@@ -1235,7 +1422,7 @@ if start_button:
                 st.session_state.rag_result = rag_result
                 st.session_state.retrieved_docs = retrieved_docs
 
-                st.write("📝 기사별 세부 분석 중...")
+                st.write("기사별 세부 분석 중...")
                 analysis_results = []
                 progress = st.progress(0)
 
@@ -1249,8 +1436,14 @@ if start_button:
                 analysis_df = pd.DataFrame(analysis_results)
                 final_df = pd.concat([article_df.reset_index(drop=True), analysis_df.reset_index(drop=True)],axis=1)
                 
-                # 기사별 다양성 점수 계산 (LLM 점수 덮어쓰기)
-                final_df["balance_score"] = final_df.apply(calculate_article_balance_score,axis=1)
+                final_df["llm_balance_score"] = pd.to_numeric(
+                    final_df["balance_score"],
+                    errors="coerce"
+                ).fillna(60)
+                
+                final_df["balance_score"] = final_df.apply(
+                    calculate_article_balance_score,
+                    axis=1)
                 
                 # 전체 관점 다양성 점수 계산
                 calculated_score = calculate_overall_balance_score(final_df)
@@ -1269,7 +1462,7 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
     score = rag_result.get("overall_balance_score", 0)
 
     st.markdown("---")
-    st.subheader("📊 실시간 뉴스 RAG 분석 결과")
+    st.subheader("실시간 뉴스 RAG 분석 결과")
 
     metric_col1, metric_col2, metric_col3 = st.columns(3)
 
@@ -1282,13 +1475,13 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
     with metric_col3:
         st.metric("종합 관점 다양성 지표", f"{score}/100")
 
-    tabs = st.tabs(["💡 RAG 종합 분석", "📰 수집 기사 목록", "🧐 기사별 상세 분석"])
+    tabs = st.tabs(["RAG 종합 분석", "수집 기사 목록", "기사별 상세 분석"])
 
     # =================================================
     # 1. RAG 종합 분석 탭 - 고도화 버전
     # =================================================
     with tabs[0]:
-        st.markdown("## 🔎 RAG 기반 전체 관점 분석")
+        st.markdown("## RAG 기반 전체 관점 분석")
 
         summary_col, gauge_col = st.columns([1.55, 1])
 
@@ -1305,114 +1498,57 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
                 unsafe_allow_html=True
             )
             st.info(f"**AI 제언:** {rag_result.get('one_line_comment', '')}")
-
+            
         with gauge_col:
-            gauge = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=score,
-                title={"text": "관점 다양성 지표", "font": {"size": 18}},
-                gauge={
-                    "axis": {"range": [0, 100], "tickcolor": "#94a3b8"},
-                    "bar": {"color": "#60a5fa"},
-                    "bgcolor": "rgba(0,0,0,0)",
-                    "borderwidth": 2,
-                    "bordercolor": "#334155",
-                    "steps": [
-                        {"range": [0, 40], "color": "#7f1d1d"},
-                        {"range": [40, 70], "color": "#78350f"},
-                        {"range": [70, 100], "color": "#14532d"},
-                    ],
-                }
-            ))
-            gauge.update_layout(
-                height=290,
-                margin=dict(l=10, r=10, t=45, b=10),
-                paper_bgcolor="rgba(0,0,0,0)",
-                font={"color": "#f9fafb", "family": "Pretendard"}
-            )
-            st.plotly_chart(gauge, use_container_width=True, key="rag_overall_balance_gauge")
-            st.caption("전체 관점 다양성 지표는 기사들 사이의 관점 차이·언론사 다양성·표현 톤 등을 종합 계산한 참고 지표입니다.")
-
+            score = int(score)
+            
+            with st.container(border=True):
+                st.markdown("#### 관점 다양성 지표")
+                st.metric(label="종합 점수",value=f"{score}/100")
+                st.progress(score / 100)
+                st.caption("기사들 사이의 관점 차이, 언론사 다양성, 표현 톤을 종합 계산한 참고 지표입니다.")
         st.divider()
-
-        # 관점 자동 라벨 카드
-        st.markdown("## 🧭 주제별 관점 비교")
+                
+                # 관점 자동 라벨 카드
+        st.markdown("## 주제별 관점 비교")
         st.caption("경제·정치·사회 이슈에 따라 LLM이 관점 라벨을 자동으로 구성합니다.")
+        
         perspective_cards = get_perspective_cards(rag_result)
         p_cols = st.columns(3)
+        
         for i, col in enumerate(p_cols):
-            card = perspective_cards[i] if i < len(perspective_cards) else {"icon": "🧭", "label": f"관점 {i+1}", "content": "관련 관점이 충분히 수집되지 않았습니다."}
+            card = perspective_cards[i] if i < len(perspective_cards) else {
+                "icon": "",
+                "label": f"관점 {i + 1}",
+                "content": "관련 관점이 충분히 수집되지 않았습니다."}
+            
             with col:
                 st.markdown(
                     f"""
                     <div class="card">
-                        <div class="card-title">{card.get('icon', '🧭')} {card.get('label', f'관점 {i + 1}')}</div>
-                        <div class="summary-card-body">{card.get('content', '')}</div>
+                    <div class="card-title">{card.get('label', f'관점 {i + 1}')}</div>
+                    <div class="summary-card-body">{card.get('content', '')}</div>
                     </div>
                     """,
-                    unsafe_allow_html=True
-                )
+                    unsafe_allow_html=True)
 
         st.divider()
 
         # 기사별 비교표 + 키워드 차트
-        st.markdown("## 📌 기사 비교 대시보드")
-        dash_col1, dash_col2 = st.columns([1.35, 1])
+        st.markdown("## 기사 간 관점 비교")
+        st.caption("같은 이슈를 기사들이 어떤 관점으로 다루는지 비교합니다.")
+        
+        compare_df = final_df[
+            ["press","main_claim","framing","tone_label","balance_score"]].copy()
+        
+        compare_df.columns = ["언론사","핵심 주장","프레이밍","톤","표현 균형"]
+        
+        st.dataframe(compare_df,use_container_width=True,hide_index=True)
 
-        with dash_col1:
-            compare_columns = ["press", "title", "main_claim", "tone_label", "balance_score"]
-            for col_name in compare_columns:
-                if col_name not in final_df.columns:
-                    final_df[col_name] = "" if col_name != "balance_score" else 50
-
-            compare_df = final_df[compare_columns].copy()
-            compare_df.columns = ["언론사", "기사 제목", "핵심 주장", "톤", "다양성 점수"]
-            st.dataframe(compare_df, use_container_width=True, hide_index=True)
-
-        with dash_col2:
-            keyword_df = keyword_counter_from_df(final_df, top_n=12)
-            if len(keyword_df) > 0:
-                fig_keyword = px.bar(keyword_df, x="빈도", y="키워드", orientation="h", title="수집 기사 핵심 키워드")
-                fig_keyword.update_layout(
-                    height=360,
-                    margin=dict(l=10, r=10, t=45, b=10),
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    font={"color": "#f9fafb", "family": "Pretendard"}
-                )
-                st.plotly_chart(fig_keyword, use_container_width=True, key="keyword_bar_chart")
-            else:
-                st.info("키워드를 추출할 수 없습니다.")
-
-        # 기사별 관점 위치 스펙트럼
-        if "issue_position_score" in final_df.columns:
-            st.markdown("## 🧪 기사별 관점 스펙트럼")
-            spectrum_df = final_df[["press", "title", "issue_position_score"]].copy()
-            spectrum_df["issue_position_score"] = pd.to_numeric(spectrum_df["issue_position_score"], errors="coerce").fillna(50)
-            spectrum_df["기준선"] = "기사별 위치"
-            fig_spectrum = px.scatter(
-                spectrum_df,
-                x="issue_position_score",
-                y="기준선",
-                text="press",
-                hover_data={"title": True, "issue_position_score": True, "기준선": False},
-                range_x=[0, 100],
-                title="0에 가까울수록 한쪽 관점, 100에 가까울수록 다른 관점으로 해석"
-            )
-            fig_spectrum.update_traces(textposition="top center", marker=dict(size=18))
-            fig_spectrum.update_layout(
-                height=260,
-                margin=dict(l=10, r=10, t=50, b=20),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font={"color": "#f9fafb", "family": "Pretendard"}
-            )
-            st.plotly_chart(fig_spectrum, use_container_width=True, key="article_position_spectrum")
-
-        st.divider()
+    
 
         # 강조점 차이
-        st.markdown("## 🧩 기사들이 강조한 내용")
+        st.markdown("## 기사들이 강조한 내용")
         emphasis_items = get_text_list(rag_result.get("emphasis_differences"))
         for item in emphasis_items:
             st.markdown(
@@ -1429,18 +1565,18 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
         missing_col, question_col = st.columns(2)
 
         with missing_col:
-            st.markdown("## 👀 빠져 있을 수 있는 관점")
+            st.markdown("## 빠져 있을 수 있는 관점")
             for item in get_text_list(rag_result.get("missing_perspectives")):
                 st.warning(item)
 
         with question_col:
-            st.markdown("## ❓ 생각해볼 질문")
+            st.markdown("## 생각해볼 질문")
             for item in get_text_list(rag_result.get("thinking_questions")):
                 st.info(item)
 
         st.divider()
 
-        with st.expander("🔍 RAG 검색 근거 확인"):
+        with st.expander("RAG 검색 근거 확인"):
             for i, doc in enumerate(st.session_state.retrieved_docs, start=1):
                 st.markdown(f"### 근거 {i}")
                 st.markdown(f"**제목:** {doc.metadata.get('title', '')}")
@@ -1449,7 +1585,7 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
                 st.text(doc.page_content[:1200])
                 st.divider()
         
-        st.markdown("## 🧭 나의 관점 패턴 리포트")
+        st.markdown("## 나의 관점 패턴 리포트")
         st.caption("기사별 상세 분석 탭에서 각 기사에 대한 반응을 선택하면 이곳에서 관점 패턴을 확인할 수 있습니다.")
         
         if st.button("🧭 나의 관점 패턴 분석하기", use_container_width=True):
@@ -1460,63 +1596,104 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
         if st.session_state.user_perspective_report:
             report = st.session_state.user_perspective_report
             
-            st.markdown("### 📊 나의 관점 패턴 리포트")
+            st.markdown("### 나의 관점 패턴 리포트")
             
             c1, c2, c3 = st.columns(3)
             c1.metric("동의", report["agree_count"])
             c2.metric("동의하지 않음", report["disagree_count"])
             c3.metric("판단 보류", report["hold_count"])
             
-            st.info(
-                f"""
-                내가 주로 동의한 기사 톤은 **{report['agree_tones']}** 입니다.  
-                거리감을 느낀 기사 톤은 **{report['disagree_tones']}** 이고,  
-                판단을 보류한 기사 톤은 **{report['hold_tones']}** 입니다.
-                """)
+            agreed_html = "".join(
+                [f"<div class='report-item'>{claim}</div>" for claim in report["agreed_claims"][:3]]
+            ) or "<div class='report-empty'>아직 동의한 기사가 없습니다.</div>"
+            
+            disagreed_html = "".join(
+                [f"<div class='report-item orange'>{claim}</div>" for claim in report["disagreed_claims"][:3]]
+            ) or "<div class='report-empty'>아직 동의하지 않은 기사가 없습니다.</div>"
             
             col_a, col_b = st.columns(2)
+            
             with col_a:
-                st.markdown("#### 👍 내가 수용한 주장")
-                if report["agreed_claims"]:
-                    for claim in report["agreed_claims"]:
-                        st.markdown(f"- {claim}")
-                else:
-                    st.caption("아직 동의한 기사가 없습니다.")
-                st.markdown("#### 🔑 내가 반응한 핵심 키워드")
-                if report["agreed_keywords"]:
-                    st.write(", ".join(report["agreed_keywords"]))
-                else:
-                    st.caption("아직 확인된 키워드가 없습니다.")
+                st.markdown(
+                    f"""
+                    <div class="report-card">
+                        <div class="report-title">내가 수용한 주장</div>
+                        {agreed_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True)
+                
             with col_b:
-                st.markdown("#### 🤔 내가 거리감을 느낀 주장")
-                if report["disagreed_claims"]:
-                    for claim in report["disagreed_claims"]:
-                        st.markdown(f"- {claim}")
-                else:
-                    st.caption("아직 동의하지 않은 기사가 없습니다.")
-                    
-                st.markdown("#### 🧭 거리감을 느낀 프레이밍")
-                if report["disagreed_frames"]:
-                    for frame in report["disagreed_frames"]:
-                        st.markdown(f"- {frame}")
-                else:
-                    st.caption("아직 확인된 프레이밍이 없습니다.")
-            st.markdown("#### 👀 추가로 읽어볼 필요가 있는 관점")
-            missing_items = (report["missing_from_hold"] + 
-                             report["missing_from_disagree"])
+                st.markdown(
+                    f"""
+                    <div class="report-card">
+                        <div class="report-title">거리감을 느낀 주장</div>
+                        {disagreed_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True)
+                
+            keyword_tags = "".join(
+                [
+                    f"<span class='keyword-pill'>#{keyword}</span>"
+                    for keyword in report["agreed_keywords"][:8]
+                    ]
+            ) or "<span class='report-empty'>확인된 키워드가 없습니다.</span>"
+            
+            frame_items = "".join(
+                [
+                    f"<div class='frame-item'>{frame}</div>"
+                    for frame in report["disagreed_frames"][:4]
+                    ]
+            ) or "<div class='report-empty'>확인된 프레이밍이 없습니다.</div>"
+            
+            col_c, col_d = st.columns(2)
+            
+            with col_c:
+                st.markdown(
+                    f"""
+                    <div class="report-section">
+                        <div class="report-title">반응한 핵심 키워드</div>
+                        <div class="keyword-row">
+                            {keyword_tags}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True)
+                
+            with col_d:
+                st.markdown(
+                    f"""
+                    <div class="report-section">
+                        <div class="report-title">거리감을 느낀 프레이밍</div>
+                        {frame_items}
+                    </div>
+                    """,
+                    unsafe_allow_html=True)
+                
+            missing_items = report["missing_from_hold"] + report["missing_from_disagree"]
             missing_items = list(dict.fromkeys(missing_items))
             
-            if missing_items:
-                for item in missing_items:
-                    st.markdown(f"- {item}")
-            else:
-                st.caption("현재 선택만으로는 추가 확인 관점이 충분히 도출되지 않았습니다.")
+            missing_html = "".join(
+                [f"<div class='report-item'>{item}</div>" for item in missing_items[:6]]
+            ) or "<div class='report-empty'>현재 선택만으로는 추가 확인 관점이 충분히 도출되지 않았습니다.</div>"
+            
+            st.markdown(
+                f"""
+                <div class="report-section">
+                    <div class="report-title">추가로 읽어볼 필요가 있는 관점</div>
+                    <div class="missing-grid">
+                        {missing_html}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True)
 
     # =================================================
     # 2. 수집 기사 목록 탭
     # =================================================
     with tabs[1]:
-        st.markdown("## 📰 실시간 수집 기사 목록")
+        st.markdown("## 실시간 수집 기사 목록")
         st.caption("이번 분석에 실제로 사용된 기사 목록입니다.")
 
         for i, row in final_df.iterrows():
@@ -1543,7 +1720,7 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
     # 3. 기사별 상세 분석 탭
     # =================================================
     with tabs[2]:
-        st.markdown("## 🧐 기사별 상세 관점 분석")
+        st.markdown("## 기사별 상세 관점 분석")
 
         selected_title = st.selectbox(
             "분석할 기사를 선택하세요",
@@ -1570,30 +1747,19 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
                 """,
                 unsafe_allow_html=True
             )
-            st.markdown(f"[🔗 기사 원문 보기]({row['url']})")
+            st.markdown(f"[기사 원문 보기]({row['url']})")
 
             article_score = int(row.get("balance_score", 0))
-            article_gauge = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=article_score,
-                title={"text": "기사 표현 균형 지표", "font": {"size": 15}},
-                gauge={
-                    "axis": {"range": [0, 100]},
-                    "bar": {"color": "#60a5fa"},
-                    "steps": [
-                        {"range": [0, 40], "color": "#7f1d1d"},
-                        {"range": [40, 70], "color": "#78350f"},
-                        {"range": [70, 100], "color": "#14532d"},
-                    ],
-                }
-            ))
-            article_gauge.update_layout(
-                height=220,
-                margin=dict(l=10, r=10, t=40, b=0),
-                paper_bgcolor="rgba(0,0,0,0)",
-                font={"color": "#f9fafb", "family": "Pretendard"}
-            )
-            st.plotly_chart(article_gauge, use_container_width=True, key=f"article_gauge_{row_idx}")
+            with st.container(border=True):
+                st.markdown("##### 기사 표현 균형 지표")
+                st.metric(label="기사 점수",value=f"{article_score}/100")
+                st.progress(article_score/100)
+                if article_score >= 70:
+                    st.caption("다양한 관점과 반론이 비교적 함께 제시된 기사입니다.")
+                elif article_score >= 40:
+                    st.caption("일부 관점은 포함되었지만 특정 강조가 존재할 수 있습니다.")
+                else:
+                    st.caption("특정 주장이나 표현이 강하게 강조된 기사입니다.")
 
         with main_col:
             st.markdown(f"### {row['title']}")
@@ -1604,45 +1770,165 @@ if st.session_state.final_df is not None and st.session_state.rag_result is not 
                 unsafe_allow_html=True
             )
 
-            st.markdown("#### 🧾 핵심 요약")
-            st.success(row["summary"])
-
-            st.markdown("#### 🗣️ 주요 주장")
-            st.info(row["main_claim"])
-
-            st.markdown("#### 🧭 프레이밍 분석")
-            st.warning(row["framing"])
-
-            exp_col1, exp_col2 = st.columns(2)
-
-            with exp_col1:
-                st.markdown("#### 감정적 표현")
-                for item in make_list(row["emotional_expressions"]):
-                    st.markdown(f"- {item}")
-
-            with exp_col2:
-                st.markdown("#### 단정적 표현")
-                for item in make_list(row["assertive_expressions"]):
-                    st.markdown(f"- {item}")
-
-            st.markdown("#### 👀 빠져 있을 수 있는 관점")
-            for item in get_text_list(row["missing_perspectives"]):
-                st.markdown(f"- {item}")
-
-            st.markdown("#### 🧪 표현 온도계")
+            st.markdown("#### 핵심 요약")
+            st.markdown(
+                f"""
+                <div class="mini-card">
+                <div class="summary-card-body">
+                {row.get("summary", "")}
+                </div>
+                </div>
+                """,
+                unsafe_allow_html=True)
+            
+            st.markdown("#### 주요 주장")
+            st.markdown(
+                f"""
+                <div style="
+                background:#eff6ff;
+                border:1px solid #bfdbfe;
+                border-left:5px solid #2563eb;
+                border-radius:14px;
+                padding:18px;
+                font-size:16px;
+                line-height:1.8;
+                color:#0f172a;
+                margin-bottom:18px;
+                ">
+                {row.get("main_claim", "")}
+                </div>
+                """,
+                unsafe_allow_html=True)
+            
+            st.markdown("#### 기사 관점 분석")
+            emotion_items = get_text_list(row.get("emotional_expressions"))
+            assert_items = get_text_list(row.get("assertive_expressions"))
+            missing_items = get_text_list(row.get("missing_perspectives"))
+            
+            emotion_html = (
+                "".join([f"<li>{x}</li>" for x in emotion_items])
+                if emotion_items
+                else "<span style='color:#94a3b8'>해당 표현 없음</span>")
+            
+            assert_html = (
+                "".join([f"<li>{x}</li>" for x in assert_items])
+                if assert_items
+                else "<span style='color:#94a3b8'>해당 표현 없음</span>")
+            
+            missing_html = (
+                "".join([f"<li>{x}</li>" for x in missing_items])
+                if missing_items
+                else "<span style='color:#94a3b8'>추가 관점 없음</span>")
+            
+            analysis_box_html = f"""
+            <div style="
+            background:#ffffff;
+            border:1px solid #dbeafe;
+            border-left:6px solid #2563eb;
+            border-radius:18px;
+            padding:20px;
+            margin-bottom:22px;
+            ">
+            
+            <div style="
+            display:grid;
+            grid-template-columns:1fr 1fr;
+            gap:16px;
+            ">
+            
+            <div style="background:#f8fafc;border-radius:14px;padding:16px;">
+            <div style="font-size:15px;font-weight:850;color:#1d4ed8;margin-bottom:10px;">
+            프레이밍
+            </div>
+            
+            <div style="line-height:1.8;">
+            {row.get("framing","-")}
+            </div>
+            </div>
+            
+            <div style="background:#f8fafc;border-radius:14px;padding:16px;">
+            <div style="font-size:15px;font-weight:850;color:#1d4ed8;margin-bottom:10px;">
+            빠져 있을 수 있는 관점
+            </div>
+            
+            <ul style="padding-left:18px;margin:0;">
+            {missing_html}
+            </ul>
+            </div>
+            
+            <div style="background:#f8fafc;border-radius:14px;padding:16px;">
+            <div style="font-size:15px;font-weight:850;color:#1d4ed8;margin-bottom:10px;">
+            감정적 표현
+            </div>
+            
+            <ul style="padding-left:18px;margin:0;">
+            {emotion_html}
+            </ul>
+            </div>
+            
+            <div style="background:#f8fafc;border-radius:14px;padding:16px;">
+            <div style="font-size:15px;font-weight:850;color:#1d4ed8;margin-bottom:10px;">
+            단정적 표현
+            </div>
+            
+            <ul style="padding-left:18px;margin:0;">
+            {assert_html}
+            </ul>
+            </div>
+            </div>
+            </div>
+            """
+            
+            st.markdown(analysis_box_html, unsafe_allow_html=True)
+            
+            st.markdown("#### 표현 강도")
             temp_label, temp_score = expression_temperature(row)
             st.progress(temp_score / 100)
-            st.caption(f"{temp_label} · 감정적/단정적 표현 개수 기반 참고 지표")
-
+            st.caption(
+                "감정적 표현과 단정적 표현의 개수를 바탕으로, 기사 문장이 얼마나 강한 어조로 쓰였는지 보여주는 참고 지표입니다.")
+            
             if "key_keywords" in row and safe_join_items(row.get("key_keywords")) != "-":
-                st.markdown("#### #️⃣ 기사 핵심 키워드")
-                st.write(safe_join_items(row.get("key_keywords")))
+                tags = []
+                for keyword in get_text_list(row.get("key_keywords")):
+                    tags.append(
+                        f"""
+                    <span style="
+                        display:inline-flex;
+                        align-items:center;
+                        justify-content:center;
+                        background:#eff6ff;
+                        border:1px solid #bfdbfe;
+                        color:#2563eb;
+                        border-radius:999px;
+                        padding:8px 14px;
+                        font-size:13px;
+                        font-weight:700;
+                    ">
+                    #{keyword}
+                    </span>
+                    """
+                    )
+                    
+                keyword_html = "".join(tags)
+                st.markdown(
+                    f"""
+                    <div style="
+                        display:flex;
+                        flex-wrap:wrap;
+                        gap:10px;
+                        margin-top:18px;
+                        margin-bottom:25px;
+                    ">
+                        {keyword_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True)
 
             st.caption(
                 "※ 위 분석은 기사 원문을 바탕으로 LLM이 생성한 참고 정보이며, 기사 내용의 사실 여부나 정치적 성향을 확정하지 않습니다."
             )
             st.divider()
-            st.markdown("#### 🙋 이 기사에 대한 나의 반응")
+            st.markdown("#### 이 기사에 대한 나의 반응")
             
             reaction = st.radio(
                 "이 기사 관점에 대한 나의 반응을 선택하세요",
