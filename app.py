@@ -475,6 +475,11 @@ def build_user_perspective_report(final_df, reactions):
 # 네이버 뉴스 수집 - Streamlit Cloud 안정화 버전
 # =====================================================
 def search_naver_news(query, display=5, sort="sim"):
+    """
+    네이버 뉴스 API 호출 함수.
+    - timeout이 발생해도 앱이 죽지 않고 빈 리스트를 반환합니다.
+    - Streamlit Cloud에서 안정적으로 돌리기 위해 display와 timeout을 작게 설정합니다.
+    """
     url = "https://openapi.naver.com/v1/search/news.json"
 
     headers = {
@@ -488,45 +493,45 @@ def search_naver_news(query, display=5, sort="sim"):
         "sort": sort
     }
 
-    st.write(f"🔍 네이버 API 요청 시작: {query}")
+    # 배포 환경 디버깅용 로그
+    st.write(f"🔍 네이버 API 요청 시작: {query} / display={display} / sort={sort}")
 
     try:
         response = requests.get(
             url,
             headers=headers,
             params=params,
-            timeout=(10, 20)
+            timeout=(30, 30)  # 연결 30초, 응답 30초
         )
 
-        st.write(f"✅ 응답 코드: {response.status_code}")
+        st.write(f"✅ 네이버 API 응답 코드: {response.status_code}")
 
         if response.status_code != 200:
-            st.error(f"❌ API 오류 코드: {response.status_code}")
-            st.text(response.text)
+            st.warning(f"네이버 API 응답 오류: {response.status_code} / 검색어: {query}")
+            st.text(response.text[:500])
             return []
 
-        data = response.json()
+        items = response.json().get("items", [])
+        st.write(f"📦 네이버 API 수집 결과: {len(items)}개")
+        return items
 
-        st.write(f"📦 수집 기사 수: {len(data.get('items', []))}")
-
-        return data.get("items", [])
-
-    except requests.exceptions.ConnectTimeout:
-        st.error(f"🚨 ConnectTimeout 발생: {query}")
+    except requests.exceptions.ConnectTimeout as e:
+        st.error(f"🚨 ConnectTimeout: Streamlit Cloud에서 openapi.naver.com 연결 자체가 지연되었습니다. 검색어: {query}")
+        st.text(str(e)[:500])
         return []
 
-    except requests.exceptions.ReadTimeout:
-        st.error(f"🚨 ReadTimeout 발생: {query}")
+    except requests.exceptions.ReadTimeout as e:
+        st.error(f"🚨 ReadTimeout: 네이버 API 연결 후 응답 수신이 지연되었습니다. 검색어: {query}")
+        st.text(str(e)[:500])
         return []
 
-    except requests.exceptions.ConnectionError as e:
-        st.error(f"🚨 ConnectionError 발생")
-        st.text(str(e))
+    except requests.exceptions.RequestException as e:
+        st.warning(f"네이버 API 요청 중 오류가 발생했습니다: {query}")
+        st.text(str(e)[:500])
         return []
 
-    except Exception as e:
-        st.error(f"🚨 알 수 없는 오류 발생")
-        st.text(str(e))
+    except Exception:
+        st.warning(f"뉴스 검색 중 알 수 없는 오류가 발생했습니다: {query}")
         return []
 
 
@@ -541,13 +546,8 @@ def collect_articles(query, max_articles=3):
     """
     query = query.strip()
 
-    # 전세사기 전용 검색어를 제거하고, 모든 주제에 쓸 수 있는 일반 확장어만 사용
-    search_queries = [
-        query,
-        f"{query} 원인",
-        f"{query} 영향",
-        f"{query} 전망",
-    ]
+    # Streamlit Cloud에서 네이버 API 연결이 불안정할 수 있어 API 호출을 1회로 제한
+    search_queries = [query]
 
     articles = []
     seen_urls = set()
@@ -1351,8 +1351,8 @@ with search_col1:
 with search_col2:
     max_articles = st.slider(
         "수집 기사 수",
-        min_value=2,
-        max_value=4,
+        min_value=1,
+        max_value=3,
         value=3
     )
 
