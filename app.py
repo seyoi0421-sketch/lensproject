@@ -30,14 +30,34 @@ st.set_page_config(
     layout="wide"
 )
 
-NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
-NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
-OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+# Streamlit Cloud Secrets
+# Manage app → Settings → Secrets 에 아래 3개 키를 넣어야 실제 분석이 동작합니다.
+NAVER_CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+
+if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET or not OPENAI_API_KEY:
+    st.error(
+        "API 키가 설정되지 않았습니다. Streamlit Cloud의 Secrets에 "
+        "NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, OPENAI_API_KEY를 입력해주세요."
+    )
+    st.stop()
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 REACTION_FILE = "user_reactions.csv"
+
+# =====================================================
+# 배포/timeout 안정화 설정
+# =====================================================
+NAVER_TIMEOUT = 5
+ARTICLE_TIMEOUT = 5
+ARTICLE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 # =====================================================
@@ -469,7 +489,7 @@ def build_user_perspective_report(final_df, reactions):
 # =====================================================
 # 네이버 뉴스 수집
 # =====================================================
-def search_naver_news(query, display=30, sort="sim"):
+def search_naver_news(query, display=10, sort="sim"):
     url = "https://openapi.naver.com/v1/search/news.json"
 
     headers = {
@@ -483,7 +503,7 @@ def search_naver_news(query, display=30, sort="sim"):
         "sort": sort
     }
 
-    response = requests.get(url, headers=headers, params=params, timeout=10)
+    response = requests.get(url, headers=headers, params=params, timeout=NAVER_TIMEOUT)
 
     if response.status_code != 200:
         st.error(f"네이버 API 오류: {response.status_code}")
@@ -513,7 +533,7 @@ def collect_articles(query, max_articles=5):
         if len(articles) >= max_articles:
             break
 
-        items = search_naver_news(q, display=20, sort="sim") + search_naver_news(q, display=10, sort="date")
+        items = search_naver_news(q, display=8, sort="sim") + search_naver_news(q, display=5, sort="date")
 
         for item in items:
             title = remove_html(item.get("title", ""))
@@ -528,8 +548,19 @@ def collect_articles(query, max_articles=5):
                 continue
 
             try:
-                article = Article(article_url, language="ko")
-                article.download()
+                # newspaper3k의 article.download()는 느린 사이트에서 timeout이 잘 발생합니다.
+                # 그래서 requests.get에 timeout을 직접 걸고, 받아온 HTML을 newspaper에 넣어 파싱합니다.
+                html_response = requests.get(
+                    article_url,
+                    headers={"User-Agent": ARTICLE_USER_AGENT},
+                    timeout=ARTICLE_TIMEOUT
+                )
+
+                if html_response.status_code != 200 or not html_response.text:
+                    continue
+
+                article = Article(article_url, language="ko", fetch_images=False)
+                article.set_html(html_response.text)
                 article.parse()
 
                 raw_text = article.text
@@ -659,12 +690,12 @@ URL: {url}
     return "\n\n".join(formatted)
 
 
-def analyze_issue_with_rag(query, vectorstore, k=8):
+def analyze_issue_with_rag(query, vectorstore, k=6):
     retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={
             "k": k,
-            "fetch_k": 20,
+            "fetch_k": 12,
             "lambda_mult": 0.7
         }
     )
@@ -790,7 +821,7 @@ def analyze_one_article(article):
   "issue_position_score": "0~100 사이 정수. 기사 관점의 위치를 나타내는 참고 점수. 한쪽 주장만 강하게 강조하면 낮거나 높게, 여러 관점을 함께 제시하면 중간에 가깝게 평가",
   "emotional_expressions": "기사에 실제로 등장한 감정적 표현만 배열로 작성. 없으면 빈 배열 []",
   "assertive_expressions": "기사에 실제로 등장한 단정적 표현만 배열로 작성. 없으면 빈 배열 []",
-  "missing_perspectives": "기사에서 충분히 다루지 않은 관점만 배열로 작성. 없으면 빈 배열 []",2"],
+  "missing_perspectives": ["기사에서 충분히 다루지 않은 관점 1", "기사에서 충분히 다루지 않은 관점 2"],
   "balance_score": "0~100 사이 정수. 기사 안에서 반론, 이해관계자, 누락 가능성, 표현 균형이 얼마나 드러나는지 평가",
   "one_line_comment": "사용자에게 보여줄 한 줄 설명"
 }}
@@ -1318,9 +1349,9 @@ with search_col1:
 with search_col2:
     max_articles = st.slider(
         "수집 기사 수",
-        min_value=3,
-        max_value=7,
-        value=5
+        min_value=2,
+        max_value=4,
+        value=3
     )
 
 # =====================================================
@@ -1418,7 +1449,7 @@ if start_button:
                 vectorstore = create_realtime_vectorstore(articles)
 
                 st.write("⚖️ RAG 기반 전체 관점 분석 중...")
-                rag_result, retrieved_docs = analyze_issue_with_rag(query, vectorstore, k=8)
+                rag_result, retrieved_docs = analyze_issue_with_rag(query, vectorstore, k=min(6, len(articles)))
                 st.session_state.rag_result = rag_result
                 st.session_state.retrieved_docs = retrieved_docs
 
