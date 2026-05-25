@@ -498,7 +498,7 @@ def search_naver_news(query, display=5, sort="sim"):
             url,
             headers=headers,
             params=params,
-            timeout=(2, 4)  # 연결 2초, 응답 4초
+            timeout=(10,20)  # 연결 2초, 응답 4초
         )
 
         if response.status_code != 200:
