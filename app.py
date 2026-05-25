@@ -30,9 +30,14 @@ st.set_page_config(
     layout="wide"
 )
 
-NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
-NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
-OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+NAVER_CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+
+# Secrets가 없으면 앱이 바로 죽지 않고 화면에 안내합니다.
+if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET or not OPENAI_API_KEY:
+    st.error("Streamlit Secrets에 NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, OPENAI_API_KEY를 모두 입력해주세요.")
+    st.stop()
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -467,9 +472,14 @@ def build_user_perspective_report(final_df, reactions):
     }
 
 # =====================================================
-# 네이버 뉴스 수집
+# 네이버 뉴스 수집 - Streamlit Cloud 안정화 버전
 # =====================================================
-def search_naver_news(query, display=30, sort="sim"):
+def search_naver_news(query, display=5, sort="sim"):
+    """
+    네이버 뉴스 API 호출 함수.
+    - timeout이 발생해도 앱이 죽지 않고 빈 리스트를 반환합니다.
+    - Streamlit Cloud에서 안정적으로 돌리기 위해 display와 timeout을 작게 설정합니다.
+    """
     url = "https://openapi.naver.com/v1/search/news.json"
 
     headers = {
@@ -483,94 +493,107 @@ def search_naver_news(query, display=30, sort="sim"):
         "sort": sort
     }
 
-    response = requests.get(url, headers=headers, params=params, timeout=10)
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=(2, 4)  # 연결 2초, 응답 4초
+        )
 
-    if response.status_code != 200:
-        st.error(f"네이버 API 오류: {response.status_code}")
+        if response.status_code != 200:
+            st.warning(f"네이버 API 응답 오류: {response.status_code} / 검색어: {query}")
+            return []
+
+        return response.json().get("items", [])
+
+    except requests.exceptions.Timeout:
+        st.warning(f"네이버 API 연결 시간이 초과되었습니다. 다른 검색어로 다시 시도해주세요: {query}")
         return []
 
-    return response.json().get("items", [])
+    except requests.exceptions.RequestException:
+        st.warning(f"네이버 API 요청 중 오류가 발생했습니다: {query}")
+        return []
 
-def collect_articles(query, max_articles=5):
+    except Exception:
+        st.warning(f"뉴스 검색 중 알 수 없는 오류가 발생했습니다: {query}")
+        return []
+
+
+def collect_articles(query, max_articles=3):
+    """
+    네이버 API 기반 기사 수집 함수.
+    기존의 newspaper3k 전문 크롤링(article.download/parse)은 Streamlit Cloud에서
+    timeout이 자주 발생하므로 제거했습니다.
+
+    대신 네이버 API가 제공하는 제목(title) + 요약(description)을 분석 본문으로 사용합니다.
+    이 방식은 전문 크롤링보다 가볍고 배포 환경에서 훨씬 안정적입니다.
+    """
+    query = query.strip()
+
+    # 전세사기 전용 검색어를 제거하고, 모든 주제에 쓸 수 있는 일반 확장어만 사용
     search_queries = [
-        f"{query} 피해자 인터뷰",
-        f"{query} 보증금 반환",
-        f"{query} 임대인 처벌",
-        f"{query} 정부 대책",
-        f"{query} 특별법",
-        f"{query} 법원 판결",
-        f"{query} 경찰 수사",
+        query,
+        f"{query} 원인",
+        f"{query} 영향",
+        f"{query} 전망",
     ]
 
     articles = []
     seen_urls = set()
     seen_title_list = []
-    seen_text_list = []
     press_count = {}
 
-    # 관점별 검색어에서 1개씩만 뽑기
     for q in search_queries:
         if len(articles) >= max_articles:
             break
 
-        items = search_naver_news(q, display=20, sort="sim") + search_naver_news(q, display=10, sort="date")
+        # API 호출은 검색어당 1회만 수행. sort=date 호출 제거.
+        items = search_naver_news(q, display=5, sort="sim")
 
         for item in items:
+            if len(articles) >= max_articles:
+                break
+
             title = remove_html(item.get("title", ""))
             description = remove_html(item.get("description", ""))
             article_url = item.get("originallink") or item.get("link")
             press = get_press_name(article_url)
 
-            if not article_url or article_url in seen_urls:
+            if not title or not article_url:
                 continue
 
+            if article_url in seen_urls:
+                continue
+
+            # 같은 언론사 기사만 몰리는 것을 방지
             if press_count.get(press, 0) >= 1:
                 continue
 
-            try:
-                article = Article(article_url, language="ko")
-                article.download()
-                article.parse()
-
-                raw_text = article.text
-                if not raw_text:
-                    continue
-
-                cleaned_text = clean_news_text(raw_text)
-
-                if not is_valid_article(cleaned_text):
-                    continue
-
-                if not is_relevant_to_query(query, title, description, cleaned_text):
-                    continue
-
-                if any(SequenceMatcher(None, title, old).ratio() >= 0.45 for old in seen_title_list):
-                    continue
-
-                current_sample = cleaned_text[:800]
-                if any(SequenceMatcher(None, current_sample, old).ratio() >= 0.35 for old in seen_text_list):
-                    continue
-
-                seen_urls.add(article_url)
-                seen_title_list.append(title)
-                seen_text_list.append(current_sample)
-                press_count[press] = press_count.get(press, 0) + 1
-
-                articles.append({
-                    "query": query,
-                    "title": article.title if article.title else title,
-                    "description": description,
-                    "url": article_url,
-                    "press": press,
-                    "pub_date": item.get("pubDate", ""),
-                    "cleaned_text": cleaned_text,
-                    "collected_at": datetime.now().strftime("%Y.%m.%d %H:%M")
-                })
-
-                break  # 이 검색어에서는 1개만 뽑고 다음 관점 검색어로 이동
-
-            except Exception:
+            # 제목 유사도가 높으면 중복 기사로 간주
+            if any(SequenceMatcher(None, title, old).ratio() >= 0.65 for old in seen_title_list):
                 continue
+
+            cleaned_text = clean_news_text(f"{title}. {description}")
+
+            # 네이버 API 요약 기반이므로 길이 기준을 너무 엄격하게 두지 않음
+            if len(cleaned_text.strip()) < 30:
+                continue
+
+            seen_urls.add(article_url)
+            seen_title_list.append(title)
+            press_count[press] = press_count.get(press, 0) + 1
+
+            articles.append({
+                "query": query,
+                "title": title,
+                "description": description,
+                "url": article_url,
+                "press": press,
+                "pub_date": item.get("pubDate", ""),
+                "cleaned_text": cleaned_text,
+                "collected_at": datetime.now().strftime("%Y.%m.%d %H:%M")
+            })
 
     return articles
 
@@ -788,9 +811,9 @@ def analyze_one_article(article):
   "tone_label": "중립/우려/비판/긍정/강조 중 하나",
   "key_keywords": ["핵심 키워드 1", "핵심 키워드 2", "핵심 키워드 3"],
   "issue_position_score": "0~100 사이 정수. 기사 관점의 위치를 나타내는 참고 점수. 한쪽 주장만 강하게 강조하면 낮거나 높게, 여러 관점을 함께 제시하면 중간에 가깝게 평가",
-  "emotional_expressions": "기사에 실제로 등장한 감정적 표현만 배열로 작성. 없으면 빈 배열 []",
-  "assertive_expressions": "기사에 실제로 등장한 단정적 표현만 배열로 작성. 없으면 빈 배열 []",
-  "missing_perspectives": "기사에서 충분히 다루지 않은 관점만 배열로 작성. 없으면 빈 배열 []",2"],
+  "emotional_expressions": ["기사에 실제로 등장한 감정적 표현 1", "기사에 실제로 등장한 감정적 표현 2"],
+  "assertive_expressions": ["기사에 실제로 등장한 단정적 표현 1", "기사에 실제로 등장한 단정적 표현 2"],
+  "missing_perspectives": ["기사에서 충분히 다루지 않은 관점 1", "기사에서 충분히 다루지 않은 관점 2"],
   "balance_score": "0~100 사이 정수. 기사 안에서 반론, 이해관계자, 누락 가능성, 표현 균형이 얼마나 드러나는지 평가",
   "one_line_comment": "사용자에게 보여줄 한 줄 설명"
 }}
@@ -1318,9 +1341,9 @@ with search_col1:
 with search_col2:
     max_articles = st.slider(
         "수집 기사 수",
-        min_value=3,
-        max_value=7,
-        value=5
+        min_value=2,
+        max_value=4,
+        value=3
     )
 
 # =====================================================
@@ -1403,7 +1426,7 @@ if start_button:
         st.session_state.user_perspective_report = None
 
         with st.status("LENS AI가 실시간 뉴스를 분석하고 있습니다...", expanded=True) as status:
-            st.write("네이버 API에서 관련 기사를 수집 중...")
+            st.write("네이버 API에서 제목과 요약을 수집 중...")
             articles = collect_articles(query, max_articles=max_articles)
             
 
