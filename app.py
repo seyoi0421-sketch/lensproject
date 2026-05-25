@@ -30,13 +30,9 @@ st.set_page_config(
     layout="wide"
 )
 
-NAVER_CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID", "")
-NAVER_CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET", "")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
-
-if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET or not OPENAI_API_KEY:
-    st.error("Streamlit Secrets에 NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, OPENAI_API_KEY를 모두 입력해주세요.")
-    st.stop()
+NAVER_CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
+NAVER_CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -473,11 +469,7 @@ def build_user_perspective_report(final_df, reactions):
 # =====================================================
 # 네이버 뉴스 수집
 # =====================================================
-def search_naver_news(query, display=5, sort="sim"):
-    """
-    네이버 뉴스 API 요청 함수.
-    Streamlit Cloud에서 ConnectTimeout이 나도 앱이 죽지 않도록 예외 처리합니다.
-    """
+def search_naver_news(query, display=30, sort="sim"):
     url = "https://openapi.naver.com/v1/search/news.json"
 
     headers = {
@@ -491,74 +483,39 @@ def search_naver_news(query, display=5, sort="sim"):
         "sort": sort
     }
 
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=(2, 4)  # 연결 2초, 응답 4초
-        )
+    response = requests.get(url, headers=headers, params=params, timeout=10)
 
-        if response.status_code != 200:
-            st.warning(f"네이버 API 응답 오류: {response.status_code} / 검색어: {query}")
-            return []
-
-        return response.json().get("items", [])
-
-    except requests.exceptions.Timeout:
-        st.warning(f"네이버 API 연결 시간이 초과되었습니다. 검색어를 줄이거나 다시 시도해주세요: {query}")
+    if response.status_code != 200:
+        st.error(f"네이버 API 오류: {response.status_code}")
         return []
 
-    except requests.exceptions.RequestException:
-        st.warning(f"네이버 API 요청에 실패했습니다: {query}")
-        return []
+    return response.json().get("items", [])
 
-    except Exception:
-        st.warning(f"뉴스 검색 중 알 수 없는 오류가 발생했습니다: {query}")
-        return []
-
-
-def build_search_queries(query):
-    """
-    기존 코드는 전세사기 전용 검색어(피해자 인터뷰, 보증금 반환 등)를 고정으로 붙였기 때문에
-    '반도체 랠리 피해자 인터뷰'처럼 이상한 검색어가 생성되었습니다.
-    모든 주제에 무난하게 쓸 수 있는 일반 확장어만 사용합니다.
-    """
-    query = query.strip()
-    return [
-        query,
-        f"{query} 원인",
-        f"{query} 영향",
-        f"{query} 전망",
+def collect_articles(query, max_articles=5):
+    search_queries = [
+        f"{query} 피해자 인터뷰",
+        f"{query} 보증금 반환",
+        f"{query} 임대인 처벌",
+        f"{query} 정부 대책",
+        f"{query} 특별법",
+        f"{query} 법원 판결",
+        f"{query} 경찰 수사",
     ]
-
-
-def collect_articles(query, max_articles=3):
-    """
-    Streamlit Cloud timeout 방지용 수집 함수.
-    - newspaper3k 기사 전문 크롤링 제거
-    - 네이버 API 제목 + 요약(description) 기반으로 분석
-    - 검색 API 호출 수 최소화
-    - 중복 기사 제거
-    """
-    search_queries = build_search_queries(query)
 
     articles = []
     seen_urls = set()
     seen_title_list = []
+    seen_text_list = []
     press_count = {}
 
+    # 관점별 검색어에서 1개씩만 뽑기
     for q in search_queries:
         if len(articles) >= max_articles:
             break
 
-        # date 검색까지 추가하면 API 호출이 2배가 되어 timeout 가능성이 커지므로 sim 검색만 사용
-        items = search_naver_news(q, display=5, sort="sim")
+        items = search_naver_news(q, display=20, sort="sim") + search_naver_news(q, display=10, sort="date")
 
         for item in items:
-            if len(articles) >= max_articles:
-                break
-
             title = remove_html(item.get("title", ""))
             description = remove_html(item.get("description", ""))
             article_url = item.get("originallink") or item.get("link")
@@ -567,34 +524,53 @@ def collect_articles(query, max_articles=3):
             if not article_url or article_url in seen_urls:
                 continue
 
-            # 한 언론사에서 여러 개가 몰리지 않도록 제한
             if press_count.get(press, 0) >= 1:
                 continue
 
-            # 제목 중복 또는 유사 기사 제거
-            if any(SequenceMatcher(None, title, old).ratio() >= 0.70 for old in seen_title_list):
+            try:
+                article = Article(article_url, language="ko")
+                article.download()
+                article.parse()
+
+                raw_text = article.text
+                if not raw_text:
+                    continue
+
+                cleaned_text = clean_news_text(raw_text)
+
+                if not is_valid_article(cleaned_text):
+                    continue
+
+                if not is_relevant_to_query(query, title, description, cleaned_text):
+                    continue
+
+                if any(SequenceMatcher(None, title, old).ratio() >= 0.45 for old in seen_title_list):
+                    continue
+
+                current_sample = cleaned_text[:800]
+                if any(SequenceMatcher(None, current_sample, old).ratio() >= 0.35 for old in seen_text_list):
+                    continue
+
+                seen_urls.add(article_url)
+                seen_title_list.append(title)
+                seen_text_list.append(current_sample)
+                press_count[press] = press_count.get(press, 0) + 1
+
+                articles.append({
+                    "query": query,
+                    "title": article.title if article.title else title,
+                    "description": description,
+                    "url": article_url,
+                    "press": press,
+                    "pub_date": item.get("pubDate", ""),
+                    "cleaned_text": cleaned_text,
+                    "collected_at": datetime.now().strftime("%Y.%m.%d %H:%M")
+                })
+
+                break  # 이 검색어에서는 1개만 뽑고 다음 관점 검색어로 이동
+
+            except Exception:
                 continue
-
-            cleaned_text = clean_news_text(f"{title}. {description}")
-
-            # 기사 전문이 아니라 요약 기반이므로 기준을 낮게 잡음
-            if len(cleaned_text.strip()) < 30:
-                continue
-
-            seen_urls.add(article_url)
-            seen_title_list.append(title)
-            press_count[press] = press_count.get(press, 0) + 1
-
-            articles.append({
-                "query": query,
-                "title": title,
-                "description": description,
-                "url": article_url,
-                "press": press,
-                "pub_date": item.get("pubDate", ""),
-                "cleaned_text": cleaned_text,
-                "collected_at": datetime.now().strftime("%Y.%m.%d %H:%M")
-            })
 
     return articles
 
@@ -812,9 +788,9 @@ def analyze_one_article(article):
   "tone_label": "중립/우려/비판/긍정/강조 중 하나",
   "key_keywords": ["핵심 키워드 1", "핵심 키워드 2", "핵심 키워드 3"],
   "issue_position_score": "0~100 사이 정수. 기사 관점의 위치를 나타내는 참고 점수. 한쪽 주장만 강하게 강조하면 낮거나 높게, 여러 관점을 함께 제시하면 중간에 가깝게 평가",
-  "emotional_expressions": ["기사에 실제로 등장한 감정적 표현 1", "기사에 실제로 등장한 감정적 표현 2"],
-  "assertive_expressions": ["기사에 실제로 등장한 단정적 표현 1", "기사에 실제로 등장한 단정적 표현 2"],
-  "missing_perspectives": ["기사에서 충분히 다루지 않은 관점 1", "기사에서 충분히 다루지 않은 관점 2"],
+  "emotional_expressions": "기사에 실제로 등장한 감정적 표현만 배열로 작성. 없으면 빈 배열 []",
+  "assertive_expressions": "기사에 실제로 등장한 단정적 표현만 배열로 작성. 없으면 빈 배열 []",
+  "missing_perspectives": "기사에서 충분히 다루지 않은 관점만 배열로 작성. 없으면 빈 배열 []",2"],
   "balance_score": "0~100 사이 정수. 기사 안에서 반론, 이해관계자, 누락 가능성, 표현 균형이 얼마나 드러나는지 평가",
   "one_line_comment": "사용자에게 보여줄 한 줄 설명"
 }}
@@ -1342,9 +1318,9 @@ with search_col1:
 with search_col2:
     max_articles = st.slider(
         "수집 기사 수",
-        min_value=2,
-        max_value=4,
-        value=3
+        min_value=3,
+        max_value=7,
+        value=5
     )
 
 # =====================================================
@@ -1427,7 +1403,7 @@ if start_button:
         st.session_state.user_perspective_report = None
 
         with st.status("LENS AI가 실시간 뉴스를 분석하고 있습니다...", expanded=True) as status:
-            st.write("네이버 API에서 제목과 요약을 수집 중...")
+            st.write("네이버 API에서 관련 기사를 수집 중...")
             articles = collect_articles(query, max_articles=max_articles)
             
 
@@ -1442,7 +1418,7 @@ if start_button:
                 vectorstore = create_realtime_vectorstore(articles)
 
                 st.write("⚖️ RAG 기반 전체 관점 분석 중...")
-                rag_result, retrieved_docs = analyze_issue_with_rag(query, vectorstore, k=min(6, len(articles)))
+                rag_result, retrieved_docs = analyze_issue_with_rag(query, vectorstore, k=8)
                 st.session_state.rag_result = rag_result
                 st.session_state.retrieved_docs = retrieved_docs
 
