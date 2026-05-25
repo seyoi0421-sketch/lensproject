@@ -475,11 +475,6 @@ def build_user_perspective_report(final_df, reactions):
 # 네이버 뉴스 수집 - Streamlit Cloud 안정화 버전
 # =====================================================
 def search_naver_news(query, display=5, sort="sim"):
-    """
-    네이버 뉴스 API 호출 함수.
-    - timeout이 발생해도 앱이 죽지 않고 빈 리스트를 반환합니다.
-    - Streamlit Cloud에서 안정적으로 돌리기 위해 display와 timeout을 작게 설정합니다.
-    """
     url = "https://openapi.naver.com/v1/search/news.json"
 
     headers = {
@@ -493,30 +488,45 @@ def search_naver_news(query, display=5, sort="sim"):
         "sort": sort
     }
 
+    st.write(f"🔍 네이버 API 요청 시작: {query}")
+
     try:
         response = requests.get(
             url,
             headers=headers,
             params=params,
-            timeout=(10,20)  # 연결 2초, 응답 4초
+            timeout=(10, 20)
         )
 
+        st.write(f"✅ 응답 코드: {response.status_code}")
+
         if response.status_code != 200:
-            st.warning(f"네이버 API 응답 오류: {response.status_code} / 검색어: {query}")
+            st.error(f"❌ API 오류 코드: {response.status_code}")
+            st.text(response.text)
             return []
 
-        return response.json().get("items", [])
+        data = response.json()
 
-    except requests.exceptions.Timeout:
-        st.warning(f"네이버 API 연결 시간이 초과되었습니다. 다른 검색어로 다시 시도해주세요: {query}")
+        st.write(f"📦 수집 기사 수: {len(data.get('items', []))}")
+
+        return data.get("items", [])
+
+    except requests.exceptions.ConnectTimeout:
+        st.error(f"🚨 ConnectTimeout 발생: {query}")
         return []
 
-    except requests.exceptions.RequestException:
-        st.warning(f"네이버 API 요청 중 오류가 발생했습니다: {query}")
+    except requests.exceptions.ReadTimeout:
+        st.error(f"🚨 ReadTimeout 발생: {query}")
         return []
 
-    except Exception:
-        st.warning(f"뉴스 검색 중 알 수 없는 오류가 발생했습니다: {query}")
+    except requests.exceptions.ConnectionError as e:
+        st.error(f"🚨 ConnectionError 발생")
+        st.text(str(e))
+        return []
+
+    except Exception as e:
+        st.error(f"🚨 알 수 없는 오류 발생")
+        st.text(str(e))
         return []
 
 
